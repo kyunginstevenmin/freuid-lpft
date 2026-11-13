@@ -1,0 +1,35 @@
+# Ablation arm: backbone B (plan step 6; BACKBONE_ABLATION.md non-inferiority question, L point =
+# the control arm own_v2_ctrl_s42, same data/recipe/seed). Exactly ONE flag differs from
+# configs/own_v2_ctrl_s42.yaml (backbone) plus the tag -- tests/test_resolve_args.py enforces it.
+# Epochs: all 5 run with per-epoch gen-val preds; the control arm's frozen epoch count
+# (EVALUATION.md 3.1) is applied offline by freeze_epoch.py, so the arm can queue behind the
+# control run. Decision rule (plan step 6): CIs overlap on gen-val source-macro -> keep the cheaper.
+# EC2 launch (after pre-registering in EVALUATION.md 6):
+#   CFG=configs/own_v2_B_s42.yaml PREREG=1 bash own_run_ec2.sh train
+split_dir: ../../id-fraud-detection/dataset_final   # v2; image paths resolve against its parent
+epochs: 5            # winner trained 5, shipped ep2; §3.1 freezes the count after this run
+bs: 6
+accum: 4             # effective 24, the winner's allowance
+eval_bs: 32          # eval-only (no_grad), plumbing; 8 -> 32 on 2026-09-22: eval is ~1/4 of an epoch
+res: 448x728
+aug: core
+sbi: 0.0             # synthetic-fraud injection OFF (ARCHITECTURE.md open decision 5; ablation arm)
+backbone: vit_base_patch14_reg4_dinov2   # <- the one flag delta (~87M vs ~304M)
+head_type: patch
+lora_r: 16
+select_on: genval    # gen-val source-macro; tie -> earliest (freeze_epoch.py, offline)
+workers: 16          # plumbing: retune from the data-wait readout, never a recipe change
+save_every: 250
+wandb: true
+wandb_project: freuid-own
+seed: 42
+tag: own_v2_B_s42
+# Speed knobs (PROFILING.md family 1), adopted per step 3c on 2026-09-22: ceiling script on the
+# A10G 2026-09-19, plain 9.2 vs compiled+fused 12.4 img/s (+35 %, rule was >= 15 %;
+# results/gpu_ceiling.csv). Precision stays fp16 (historical recipe; the bf16 rule is
+# unmeasurable -- see the plan's 3c note).
+compile: true
+fused_opt: true
+# W&B labels added at publish time; the run predates them and was labelled post hoc in W&B on 2026-10-08.
+wandb_group: own_v2
+wandb_job_type: B

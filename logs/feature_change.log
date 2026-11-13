@@ -1,0 +1,26 @@
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+own_v2_ctrl_s42 (247s):
+         rel_l2     cos  pool_l2
+set                             
+genval   0.9290  0.5947   1.0951
+indist   0.9814  0.5425   1.2524
+private  0.9936  0.5408   1.3419
+own_v2_L_lpft_s42 (243s):
+         rel_l2     cos  pool_l2
+set                             
+genval   0.6452  0.7825   0.4087
+indist   0.7037  0.7388   0.5623
+private  0.6654  0.7648   0.4903
+own_v2_B_s42 (86s):
+         rel_l2     cos  pool_l2
+set                             
+genval   0.8474  0.6562   0.8185
+indist   0.9596  0.5812   1.0836
+private  0.9126  0.6156   0.9909
+own_v2_B_lpft_s42 (86s):
+         rel_l2     cos  pool_l2
+set                             
+genval   0.7002  0.7519   0.5897
+indist   0.7496  0.7249   0.6979
+private  0.7041  0.7526   0.6170
+wrote results/feature_change.csv

@@ -1,0 +1,36 @@
+# Program 2 step 2 (docs/LEDGER.md, pre-registered 2026-10-19; plan docs/plans/2026-10-22-L-lpft-run.md):
+# LP-FT head init on the ViT-L control -- the empty cell of the {B, L} x {no LP-FT, LP-FT} grid.
+# Paired control = own_v2_ctrl_s42 (0.0365 [0.0245, 0.0442] at frozen epoch 4, S3).
+# Delta vs configs/own_v2_ctrl_s42.yaml = {lp_epochs} + tag (tests/test_resolve_args.py).
+# Same flag as the B arm (configs/own_v2_B_lpft_s42.yaml): 1 head-only epoch on frozen DINOv2
+# features (LoRA frozen at init), ADDED before the unchanged 5-epoch recipe (ARCHITECTURE.md
+# decision 6, budget amended 2026-09-24), so epoch k here == epoch k of the control in FT updates.
+# Drafted 2026-10-09, declined on cost; revived 2026-10-22 after WRITEUP-LPFT.md (SS7).
+# EC2: CFG=configs/own_v2_L_lpft_s42.yaml PREREG=1 bash own_run_ec2.sh train   (~10 h on an A10G)
+split_dir: ../../id-fraud-detection/dataset_final   # v2; image paths resolve against its parent
+epochs: 5            # winner trained 5, shipped ep2; frozen count 4 (control's) applied offline
+bs: 6
+accum: 4             # effective 24, the winner's allowance
+eval_bs: 32          # eval-only (no_grad), plumbing; 8 -> 32 on 2026-09-22: eval is ~1/4 of an epoch
+res: 448x728
+aug: core
+sbi: 0.0             # synthetic-fraud injection OFF (ARCHITECTURE.md open decision 5; ablation arm)
+backbone: vit_large_patch14_reg4_dinov2
+head_type: patch
+lora_r: 16
+select_on: genval    # gen-val source-macro; tie -> earliest (freeze_epoch.py, offline)
+workers: 16          # plumbing: retune from the data-wait readout, never a recipe change
+save_every: 250
+wandb: true
+wandb_project: freuid-own
+wandb_group: own_v2
+wandb_job_type: L_lpft
+seed: 42
+tag: own_v2_L_lpft_s42
+lp_epochs: 1         # <- the flag under test
+# Speed knobs (PROFILING.md family 1), adopted per step 3c on 2026-09-22: ceiling script on the
+# A10G 2026-09-19, plain 9.2 vs compiled+fused 12.4 img/s (+35 %, rule was >= 15 %;
+# results/gpu_ceiling.csv). Precision stays fp16 (historical recipe; the bf16 rule is
+# unmeasurable -- see the plan's 3c note).
+compile: true
+fused_opt: true

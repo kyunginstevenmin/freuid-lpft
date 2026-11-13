@@ -1,0 +1,5 @@
+base rows 142818; images found 142818; fill 0.5 for 0
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+  scale 1 (448x728): 142818 imgs in 2034s
+wrote submissions/sub_own_v2_B_lpft_s42_ep4_f0.1_w0.5_s1.csv: readout frac=0.1 w=0.5 scales=[1.0]; predicted 142818, filled 0
+submissions/sub_own_v2_B_lpft_s42_ep4_f0.1_w0.5_s1.csv 142818 rows; 0.5 left: 0 ; sha256 8a3d02575bdf

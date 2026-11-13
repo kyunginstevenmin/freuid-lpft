@@ -1,0 +1,2 @@
+  scale 1 (448x728): 256 imgs in 13s
+verify vs 557696694b46_genval_raw.csv on 256 rows: max|diff|=0.00009 mean=0.000002  (OK; fp16 dump vs live fp16 forward)

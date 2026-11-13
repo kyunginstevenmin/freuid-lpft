@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.DS_Store
+checkpoints/
+submissions/
+wandb/
+mlruns/
+.box
+data/sources/FREUID/FREUID_train/
+data/sources/SIDT_clips_cropped/Images/
+data/sources/FantasyID/train/
+data/sources/FantasyID/test/
+data/sources/IDNet_v2/Images/

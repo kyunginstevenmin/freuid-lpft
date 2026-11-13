@@ -1,0 +1,3 @@
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+  scale 1 (448x728): 256 imgs in 6s
+verify vs e678f0809bf7_genval_raw.csv on 256 rows: max|diff|=0.00001 mean=0.000000  (OK; fp16 dump vs live fp16 forward)

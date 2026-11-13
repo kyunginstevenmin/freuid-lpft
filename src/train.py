@@ -1,0 +1,713 @@
+"""Train DINOv2-L + LoRA fraud detector. Validation regimes:
+  --holdout TYPE   leave-one-doc-type-out (north-star generalization)
+  --fold K         stratified fold K as val (in-domain)
+Reports exact FREUID each epoch; saves best checkpoint + val OOF.
+
+Example:
+  python src/train.py --holdout MOZAMBIQUE/DL --epochs 4 --bs 16 --accum 2 \
+      --res 322x518 --aug strong --sbi 0.25 --tag v1
+"""
+from __future__ import annotations
+import os, sys, time, argparse, math, json, random, subprocess
+os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+import numpy as np, pandas as pd, torch, cv2, yaml
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from data import ROOT, DATA, train_path, letterbox, to_tensor_norm, load_rgb, IDNetEvalDS
+from augment import (build_transform, self_blend, region_swap, text_field_edit, erase_retype,
+                     load_field_annotations, DEFAULT_GROUPS)
+from model import FreuidModel
+from freuid_metric import freuid_score
+from evaluate import macro_scores
+from perf import TimedLoader, count_forward_flops, gpu_peak_tflops, step_metrics
+
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+torch.backends.cudnn.benchmark = True
+CKPT_DIR = os.path.join(ROOT, "checkpoints"); os.makedirs(CKPT_DIR, exist_ok=True)
+OOF_DIR = os.path.join(ROOT, "oof"); os.makedirs(OOF_DIR, exist_ok=True)
+
+
+def parse_groups(s):
+    if s in ("core", "", None): return DEFAULT_GROUPS
+    if s == "none": return {"none"}
+    return set(x.strip() for x in s.split(",") if x.strip())
+
+
+def load_image(source, idv, path):
+    """`path` wins when present (dataset_final rows, IDNet index rows); legacy FREUID fold rows
+    carry path '' and are located by id in the Kaggle dir. `source` kept for call-site compat."""
+    return load_rgb(path) if path else load_rgb(train_path(idv))
+
+
+# ---- dataset_final contract (--split_dir; id-fraud-detection/dataset_final/readme.md) ----
+SPLIT_COLS = ["id", "image_path", "label", "type", "source"]
+LEGACY_DATA_FLAGS = ("full_data", "holdout", "fold", "idnet_countries", "heldout_idnet",
+                     "idn_val_from_unused", "lim_idn", "idn_val_n")
+
+
+def _sample_per_group(df, keys, n, seed=0):
+    """At most n rows per group (all rows of smaller groups); deterministic."""
+    return pd.concat([g.sample(min(len(g), n), random_state=seed) for _, g in df.groupby(keys)],
+                     ignore_index=True)
+
+
+def load_split(split_dir, data_root, name):
+    df = pd.read_csv(os.path.join(split_dir, f"{name}.csv"))
+    missing = [c for c in SPLIT_COLS if c not in df.columns]
+    assert not missing, f"{name}.csv: missing columns {missing} (expected {SPLIT_COLS})"
+    assert set(df.label.unique()) <= {0, 1}, f"{name}.csv: labels must be 0/1"
+    df["path"] = [os.path.join(data_root, ip) for ip in df.image_path]
+    return df[["id", "label", "type", "source", "path"]]
+
+
+def build_frames_split(args):
+    """--split_dir mode: tr = train.csv, va = val.csv (in-dist; divergence alarm only),
+    gen = test.csv (the gen-val gauge, EVALUATION.md §2.1). Returns (tr, va, gen, vname).
+    Legacy data flags (FREUID folds, IDNet index) are an error here, never a silent no-op."""
+    defaults = vars(build_parser().parse_args([]))
+    bad = [k for k in LEGACY_DATA_FLAGS if getattr(args, k) != defaults[k]]
+    if bad:
+        raise SystemExit(f"--split_dir is exclusive with the legacy data flags; drop: {bad}")
+    split_dir = os.path.abspath(args.split_dir)
+    data_root = (os.path.abspath(args.data_root) if args.data_root
+                 else os.path.dirname(split_dir))                    # <root>/dataset_final -> <root>
+    tr, va, gen = (load_split(split_dir, data_root, n) for n in ("train", "val", "test"))
+    ids = [set(d.id) for d in (tr, va, gen)]
+    assert not (ids[0] & ids[1] or ids[0] & ids[2] or ids[1] & ids[2]), "id overlap across splits"
+    assert not (set(tr.type) & set(gen.type)), "test.csv types must be unseen in train.csv"
+    for d, n in ((tr, "train"), (va, "val"), (gen, "test")):
+        assert os.path.exists(d.path.iloc[0]), \
+            f"{n}.csv: first image missing at {d.path.iloc[0]} -- check --data_root"
+    if args.limit:   # smoke runs: keep every source (and every gen-val type, both classes)
+        tr = _sample_per_group(tr, ["source", "label"], max(1, args.limit // (2 * tr.source.nunique())))
+        va = _sample_per_group(va, ["source", "label"], max(1, args.limit // (2 * va.source.nunique())))
+        gen = _sample_per_group(gen, ["type", "label"], max(1, args.limit // (2 * gen.type.nunique())))
+    return tr, va, gen, os.path.basename(split_dir)
+
+
+def genval_metrics(gen, preds):
+    """One epoch's gen-val report (EVALUATION.md §1): pooled FREUID + per-type / per-source
+    FREUID + macro over types + macro over sources (the selection number, §3.1). Pure."""
+    y = gen.label.values
+    f, a, apc = freuid_score(y, preds)
+    per_type, per_source, mt, ms = macro_scores(y, preds, gen.type.values, gen.source.values)
+    return {"freuid": f, "audet": a, "apcer": apc, "per_type": per_type,
+            "per_source": per_source, "macro_type": mt, "macro_source": ms}
+
+
+def lean_state(model):
+    """Trained tensors only (LoRA A/B + head, incl. head buffers): the 'model_lean' layout
+    evaluate.py loads with strict=False. ~27 MB vs ~1.2 GB for the full state."""
+    trainable = {n for n, p in model.named_parameters() if p.requires_grad}
+    return {k: v.detach().cpu() for k, v in model.state_dict().items()
+            if k in trainable or k.startswith("head.")}
+
+
+class TrainDS(Dataset):
+    """Synthetic-fraud injection: with prob `sbi`, a genuine row is converted to fraud on the
+    fly (label -> 1). sbi=0 (default since 2026-09-17, id-fraud-detection/ARCHITECTURE.md
+    open decision 5) = OFF; the winner's recipe is sbi=0.25, kept as an ablation arm.
+    attacks='self_blend': untargeted generic self-blend only (cv1/cv2 recipe).
+    attacks='full': the annotation-driven suite (region_swap/text_field_edit/erase_retype,
+    placed via annotations/type_fields.json) that cue2/cv5 used.
+    Randomness: one numpy Generator per DataLoader worker, seeded from torch's worker seed
+    (`_worker_init`), so a run seed reproduces the same synthetic fraud (given the same
+    --workers); the num_workers=0 path seeds lazily from torch.initial_seed()."""
+    def __init__(self, ids, labels, types, H, W, groups=DEFAULT_GROUPS, sbi=0.0, attacks="self_blend",
+                 sources=None, paths=None):
+        self.rng = None                                   # set per worker by _worker_init
+        self.ids = ids; self.y = np.asarray(labels, np.float32); self.types = np.asarray(types)
+        self.src = np.asarray(sources) if sources is not None else np.full(len(ids), "freuid")
+        self.path = np.asarray(paths) if paths is not None else np.full(len(ids), "")
+        self.H, self.W = H, W; self.tf = build_transform(groups); self.sbi = sbi
+        self.attacks = attacks
+        self.gen_idx = np.where(self.y == 0)[0]
+        self.type_fields, self.type_faces = {}, {}
+        self.type_pool = {}
+        if attacks == "full":
+            self.type_fields, self.type_faces = load_field_annotations(
+                os.path.join(ROOT, "annotations", "type_fields.json"))
+            for idx in self.gen_idx:
+                self.type_pool.setdefault(self.types[idx], []).append(int(idx))
+
+    def __len__(self): return len(self.ids)
+
+    def _attack_full(self, img, rng, typ):
+        faces = self.type_faces.get(typ) or []
+        box = faces[0] if faces else None
+        fields = self.type_fields.get(typ)
+        r = rng.random(); fake = None; m = None
+        if r < 0.28:
+            pool = self.type_pool.get(typ)
+            if pool and len(pool) > 1:
+                j = int(pool[rng.integers(len(pool))])
+                try:
+                    donor = load_image(self.src[j], self.ids[j], self.path[j])
+                    fake, m = region_swap(img, donor, rng, box=box, fields=fields, faces=faces)
+                except Exception:
+                    fake = m = None
+        elif r < 0.53:
+            fake, m = text_field_edit(img, rng, box=box, fields=fields)
+        elif r < 0.76:
+            try:
+                fake, m = erase_retype(img, rng, box=box, fields=fields)
+            except Exception:
+                fake = m = None
+        if m is None or float(m.max()) <= 1e-6:      # attack couldn't apply -> guaranteed self-blend
+            fake, m = self_blend(img, rng, box=box, faces=faces)
+        return fake
+
+    def __getitem__(self, i):
+        if self.rng is None:                              # num_workers=0 (tests, --limit runs)
+            self.rng = np.random.default_rng(torch.initial_seed())
+        rng = self.rng
+        # augment on full-res then letterbox (GPU-bound anyway; full-res aug is more
+        # accurate -- resize-first measured worse: held-out Mauritius 0.0038 -> 0.0136).
+        img = load_image(self.src[i], self.ids[i], self.path[i]); y = float(self.y[i])
+        if y == 0.0 and self.sbi > 0 and rng.random() < self.sbi:
+            img = (self._attack_full(img, rng, self.types[i]) if self.attacks == "full"
+                  else self_blend(img, rng)[0])
+            y = 1.0
+        if self.tf is not None:
+            img = self.tf(image=img)["image"]
+        img = letterbox(img, self.H, self.W)
+        return to_tensor_norm(img), y
+
+
+def _worker_init(_worker_id):
+    """Seed the worker's TrainDS.rng from torch's per-worker seed (derived from the run seed,
+    fresh per DataLoader iterator; persistent workers keep advancing the same stream)."""
+    ds = torch.utils.data.get_worker_info().dataset
+    ds.rng = np.random.default_rng(torch.initial_seed())
+
+
+class ValDS(Dataset):
+    def __init__(self, ids, labels, H, W, paths=None):
+        self.ids = ids; self.y = np.asarray(labels, np.float32); self.H, self.W = H, W
+        self.paths = list(paths) if paths is not None else [""] * len(ids)
+
+    def __len__(self): return len(self.ids)
+
+    def __getitem__(self, i):
+        img = letterbox(load_image("", self.ids[i], self.paths[i]), self.H, self.W)
+        return to_tensor_norm(img), float(self.y[i])
+
+
+def corrupt_fixed(img, seed):
+    """Deterministic moderate test-like corruption (the high-impact ones from the
+    probe: resample + brightness + JPEG) -> a public-LB proxy for validation."""
+    rng = np.random.default_rng(seed)
+    h, w = img.shape[:2]; s = 0.7
+    img = cv2.resize(cv2.resize(img, (int(w * s), int(h * s)), interpolation=cv2.INTER_AREA),
+                     (w, h), interpolation=cv2.INTER_LINEAR)
+    a = 1 + rng.uniform(-0.10, 0.15); b = rng.uniform(-8, 12)
+    img = np.clip(img.astype(np.float32) * a + b, 0, 255).astype(np.uint8)
+    q = int(rng.integers(45, 75))
+    _, e = cv2.imencode(".jpg", cv2.cvtColor(img, cv2.COLOR_RGB2BGR), [cv2.IMWRITE_JPEG_QUALITY, q])
+    return cv2.cvtColor(cv2.imdecode(e, 1), cv2.COLOR_BGR2RGB)
+
+
+class HardValDS(Dataset):
+    """Val set with deterministic test-like corruption (public-LB proxy)."""
+    def __init__(self, ids, labels, H, W):
+        self.ids = ids; self.y = np.asarray(labels, np.float32); self.H, self.W = H, W
+
+    def __len__(self): return len(self.ids)
+
+    def __getitem__(self, i):
+        img = corrupt_fixed(load_rgb(train_path(self.ids[i])), i)
+        return to_tensor_norm(letterbox(img, self.H, self.W)), float(self.y[i])
+
+
+def focal_bce(logits, targets, alpha=0.25, gamma=2.0):
+    p = torch.sigmoid(logits)
+    ce = nn.functional.binary_cross_entropy_with_logits(logits, targets, reduction="none")
+    pt = torch.where(targets == 1, p, 1 - p)
+    at = torch.where(targets == 1, alpha, 1 - alpha)
+    return (at * (1 - pt).pow(gamma) * ce).mean()
+
+
+@torch.no_grad()
+def evaluate(model, dl, dtype=torch.float16):
+    model.eval(); ps, ys = [], []
+    for x, y in dl:
+        x = x.cuda(non_blocking=True)
+        with torch.autocast("cuda", dtype=dtype):
+            ps.append(torch.sigmoid(model(x)).float().cpu())
+        ys.append(y)
+    p = torch.cat(ps).numpy(); y = torch.cat(ys).numpy()
+    f, a, ap = freuid_score(y, p)
+    return f, a, ap, p
+
+def set_lora_trainable(model, flag: bool) -> int:
+    """LP-FT switch: (un)freeze every non-head trainable parameter (the LoRA A/B matrices).
+    Returns how many parameters were toggled. Head parameters are never touched."""
+    n = 0
+    for name, p in model.named_parameters():
+        if "head" not in name and (".A" in name or ".B" in name):
+            p.requires_grad_(flag); n += p.numel()
+    return n
+
+
+def build_parser():
+    ap = argparse.ArgumentParser(allow_abbrev=False)
+    ap.add_argument("--config", type=str, default=None,
+                    help="YAML run config; precedence: argparse defaults < YAML < flags "
+                         "explicitly typed on the CLI (detected via a SUPPRESS-defaults twin parse)")
+    ap.add_argument("--split_dir", type=str, default="",
+                    help="dataset_final dir holding train/val/test.csv (id,image_path,label,type,"
+                         "source). Sets tr=train.csv, va=val.csv (divergence only), gen=test.csv "
+                         "(gen-val gauge); the legacy FREUID-fold / IDNet-index flags are rejected")
+    ap.add_argument("--data_root", type=str, default="",
+                    help="root that image_path is relative to (default: split_dir's parent)")
+    ap.add_argument("--holdout", type=str, default=None)
+    ap.add_argument("--fold", type=int, default=None)
+    ap.add_argument("--full_data", action="store_true",
+                    help="train on ALL FREUID data (no held-out FREUID fold) -- for the FINAL "
+                         "model once the recipe is locked in and no further FREUID-side "
+                         "iteration is planned. Selection still uses HELDOUT-IDNet only "
+                         "(zero FREUID data cost either way). The 'val=' FREUID sample printed "
+                         "is informational only -- it IS included in training, not held out.")
+    ap.add_argument("--epochs", type=int, default=4)
+    ap.add_argument("--bs", type=int, default=24)
+    ap.add_argument("--eval_bs", type=int, default=16)
+    ap.add_argument("--accum", type=int, default=1)
+    ap.add_argument("--res", type=str, default="322x518")
+    ap.add_argument("--aug", type=str, default="core",
+                    help="'core', 'none', or comma list: degrade,color,noise,geometry,moire,dropout")
+    ap.add_argument("--sbi", type=float, default=0.0,
+                    help="prob. a genuine train row is converted to synthetic fraud per epoch. "
+                         "0 = off (default, decided 2026-09-17); winner's recipe = 0.25 with "
+                         "--attacks full (kept as an ablation arm)")
+    ap.add_argument("--attacks", type=str, default="self_blend", choices=["self_blend", "full"],
+                    help="only used when --sbi > 0. self_blend=cv1/cv2 recipe; "
+                         "full=cue2-style annotation-driven suite")
+    ap.add_argument("--lora_r", type=int, default=16)
+    ap.add_argument("--seed", type=int, default=42,
+                    help="seeds python/numpy/torch (LoRA-A + head init, data order, aug draws); "
+                         "cudnn.benchmark stays on, so runs are seeded but not bit-identical")
+    ap.add_argument("--backbone", type=str, default="vit_large_patch14_reg4_dinov2",
+                    help="timm backbone id; saved in ckpt args for eval scripts to read")
+    ap.add_argument("--head_type", type=str, default="patch", choices=["patch", "mac", "attnpool"],
+                    help="patch = per-patch MIL (default), attnpool = feature-level attention pooling, mac = multi-aspect global pooling")
+    ap.add_argument("--lr_head", type=float, default=1e-3)
+    ap.add_argument("--lr_lora", type=float, default=2e-4)
+    ap.add_argument("--wd", type=float, default=0.05)
+    ap.add_argument("--workers", type=int, default=16)
+    ap.add_argument("--limit", type=int, default=0)
+    ap.add_argument("--tag", type=str, default="v1")
+    ap.add_argument("--resume", action="store_true")
+    ap.add_argument("--save_every", type=int, default=250, help="periodic 'last' ckpt every N opt-steps")
+    ap.add_argument("--hardval", type=int, default=1, help="also eval corrupted val (public-LB proxy) & select by it")
+    ap.add_argument("--idnet_countries", type=str,
+                    default="ESP_scanned,ALB_scanned,AZE_scanned,FIN_scanned,GRC_scanned,LVA_scanned,RUS_scanned,SRB_scanned",
+                    help="IDNet countries mixed into TRAINING (comma list, '' to disable IDNet mixing entirely)")
+    ap.add_argument("--heldout_idnet", type=str, default="EST_scanned,SVK_scanned",
+                    help="IDNet countries used ONLY for the generalization eval, never trained on")
+    ap.add_argument("--idn_val_from_unused", action="store_true",
+                    help="no country held out -- all --idnet_countries appear in training, but "
+                         "validation is sampled from the images NOT selected into the lim_idn "
+                         "training cap (same countries, disjoint images, zero row-level overlap "
+                         "with training; used when --heldout_idnet '')")
+    ap.add_argument("--lim_idn", type=int, default=56000, help="cap on IDNet training rows (balanced by label)")
+    ap.add_argument("--idn_val_n", type=int, default=4000, help="HELDOUT-IDNet eval sample size")
+    ap.add_argument("--select_on", type=str, default="idnet", choices=["idnet", "hard", "clean", "genval"],
+                    help="checkpoint-selection criterion. idnet = the ONLY leak-free signal we have "
+                         "(in-domain FREUID val proved unreliable for ranking checkpoints, even the "
+                         "'hard'/corrupted proxy -- see ROADMAP 2026-07-08 entries). genval = the "
+                         "--split_dir gauge (pooled for now; source-macro lands with step 2)")
+    ap.add_argument("--wandb", action="store_true",
+                    help="log this run to Weights & Biases (config + per-epoch metrics). Off by "
+                         "default so smoke/debug runs stay out of the project; run id is "
+                         "<tag>_<vname> with resume='allow', so --resume continues the same W&B "
+                         "run -- restarting a tag from scratch should use a fresh tag")
+    ap.add_argument("--wandb_project", type=str, default="freuid-ablation")
+    ap.add_argument("--wandb_group", type=str, default=None,
+                    help="W&B group = the study (e.g. own_v2); the UI pools a group's runs")
+    ap.add_argument("--wandb_job_type", type=str, default=None,
+                    help="W&B job_type = the arm within the group (ctrl, B, B_lpft, ...); seeds share it")
+    ap.add_argument("--profile", action="store_true",
+                    help="collect ONE torch.profiler trace (PROFILING.md method: wait=5 warmup=2 "
+                         "active=5, first epoch only) into profiles/<tag>/ for the TensorBoard "
+                         "trace viewer. Off by default; ablation launch configs never set it")
+    # --- speed knobs (PROFILING.md family 1: expected score-neutral; verify parity once) ---
+    ap.add_argument("--precision", type=str, default="fp16", choices=["fp16", "bf16"],
+                    help="autocast dtype. fp16 (default, historical recipe) uses GradScaler; "
+                         "bf16 needs no scaler (no overflow-skipped steps). Ampere+ only")
+    ap.add_argument("--compile", action="store_true",
+                    help="torch.compile the training forward (dynamic=False; shapes are fixed by "
+                         "drop_last). Eval/ckpt use the uncompiled module. First epoch pays "
+                         "compile time -- read steady-state img/s from later epochs")
+    ap.add_argument("--fused_opt", action="store_true", help="AdamW(fused=True)")
+    ap.add_argument("--lp_epochs", type=int, default=0,
+                    help="LP-FT (Kumar et al. 2022; ARCHITECTURE.md decision 6): N head-only epochs on "
+                         "the frozen backbone (LoRA frozen at init, B=0 -> exact no-op) at a constant "
+                         "lr_head, BEFORE the normal --epochs recipe starts from that head. Eval printed "
+                         "per LP epoch (== lp<k>), kept in the W&B summary under lp/; no checkpoints, "
+                         "main schedule untouched. LP never checkpoints: a crash inside LP restarts "
+                         "the run; a --resume from any FT checkpoint skips LP (the head is in it)")
+    ap.add_argument("--grad_ckpt", action="store_true",
+                    help="timm gradient checkpointing on the backbone: trades ~30%% compute for "
+                         "activation memory -- a means to reach a bigger --bs/--res, not a knob "
+                         "on its own (PROFILING.md family 2)")
+    ap.add_argument("--gpu_peak_tflops", type=float, default=0.0,
+                    help="dense fp16/bf16 tensor-core peak for MFU; 0 = look up by GPU name "
+                         "(perf.PEAK_TFLOPS), unknown GPU -> MFU omitted")
+    return ap
+
+def validate_cfg(cfg, ap):
+    """Hard-fail on anything a YAML config gets wrong: non-mapping file, unknown keys
+    (typo'd hyperparameters must never become silently-default 10h runs), wrong types.
+    Values are coerced through each argparse action's own `type` callable so YAML and
+    CLI behave identically. Cross-flag consistency (fold vs full_data, idnet combos)
+    stays in main() -- it applies to pure-CLI runs too."""
+    if not isinstance(cfg, dict):
+        raise SystemExit(f"--config: expected a YAML mapping, got {type(cfg).__name__}")
+    if "config" in cfg:
+        raise SystemExit("--config: a config file may not set 'config'")
+    actions = {a.dest: a for a in ap._actions if a.dest != "help"}
+    unknown = set(cfg) - set(actions)
+    if unknown:
+        import difflib
+        hints = []
+        for k in sorted(unknown):
+            m = difflib.get_close_matches(k, actions, n=1)
+            hints.append(k + (f" (did you mean '{m[0]}'?)" if m else ""))
+        raise SystemExit("--config: unknown keys: " + ", ".join(hints))
+    out = {}
+    for k, v in cfg.items():
+        a = actions[k]
+        if isinstance(a, argparse._StoreTrueAction):
+            if not isinstance(v, bool):
+                raise SystemExit(f"--config: '{k}' must be true/false, got {v!r}")
+            out[k] = v
+        elif v is None or a.type is None:
+            out[k] = v
+        else:
+            try:
+                out[k] = a.type(v)
+            except (TypeError, ValueError):
+                raise SystemExit(f"--config: '{k}' = {v!r} is not a valid {a.type.__name__}")
+        if a.choices is not None and out[k] not in a.choices:
+            raise SystemExit(f"--config: '{k}' = {out[k]!r} not in {sorted(a.choices)}")
+    return out
+
+
+def resolve_args(argv=None):
+    """defaults < YAML < explicit CLI; see TASKS.md 2a. `argv` (list of CLI tokens)
+    defaults to sys.argv[1:] -- pass a list explicitly in tests."""
+    ap = build_parser()
+    defaults = vars(ap.parse_args([]))
+
+    aux = build_parser()
+    for a in aux._actions:            # SUPPRESS twin parse: namespace holds ONLY typed flags
+        a.default = argparse.SUPPRESS
+    explicit = vars(aux.parse_args(argv))
+
+    cfg = {}
+    cfg_path = explicit.get("config") or defaults.get("config")
+    if cfg_path:
+        with open(cfg_path) as f:
+            cfg = validate_cfg(yaml.safe_load(f) or {}, ap)
+    merged = {**defaults, **cfg, **explicit}
+    return argparse.Namespace(**merged)
+
+def git_state(repo=ROOT):
+    """(commit sha, dirty) of the training code; logged into args so the resolved YAML,
+    every checkpoint and the W&B config carry it without relying on W&B's own git capture."""
+    try:
+        sha = subprocess.check_output(["git", "-C", repo, "rev-parse", "HEAD"], text=True).strip()
+        dirty = bool(subprocess.check_output(["git", "-C", repo, "status", "--porcelain"], text=True).strip())
+        return sha, dirty
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return None, None
+
+def main():
+    args = resolve_args()
+    args.git_sha, args.git_dirty = git_state()
+    if args.git_dirty:
+        print(f"WARNING: uncommitted changes in {ROOT}; git_sha={args.git_sha} names a tree this run did not use")
+    with open(os.path.join(CKPT_DIR, f"{args.tag}_resolved.yaml"), "w") as f:
+        yaml.safe_dump(vars(args), f, sort_keys=True)   # run spec readable without loading a .pt
+    random.seed(args.seed); np.random.seed(args.seed)
+    torch.manual_seed(args.seed); torch.cuda.manual_seed_all(args.seed)
+    H, W = (int(v) for v in args.res.lower().split("x"))
+
+    if args.split_dir:
+        tr, va, gen, vname = build_frames_split(args)
+        args.hardval = 0                      # corrupted-val public-LB proxy: outside the protocol
+        idn_val = gen                         # gen-val rides the held-out eval slot
+    else:
+        df = pd.read_csv(os.path.join(ROOT, "splits", "folds.csv"))
+        if args.full_data:
+            vname = "full"
+            tr = df.copy()
+            va = df.groupby(["type", "label"], group_keys=False).apply(
+                lambda g: g.sample(min(len(g), 200), random_state=0))  # informational only, IN training
+        elif args.holdout:
+            val_mask = df.type == args.holdout; vname = "hold_" + args.holdout.replace("/", "_")
+            tr, va = df[~val_mask].copy(), df[val_mask].copy()
+        elif args.fold is not None:
+            val_mask = df.strat_fold == args.fold; vname = f"fold{args.fold}"
+            tr, va = df[~val_mask].copy(), df[val_mask].copy()
+        else:
+            raise SystemExit("specify --holdout, --fold, or --full_data")
+        if args.limit:
+            tr = tr.sample(args.limit, random_state=0); va = va.sample(min(args.limit, len(va)), random_state=0)
+        tr["source"] = "freuid"; tr["path"] = ""
+
+        idn_val = None
+        if args.idnet_countries:
+            idn = pd.read_csv(os.path.join(ROOT, "external", "idnet_cropped_index.csv"))
+            idn_pool = idn[idn.type.isin(args.idnet_countries.split(","))]
+            if args.lim_idn:
+                idn_tr = idn_pool.groupby("label", group_keys=False).apply(
+                    lambda g: g.sample(min(len(g), args.lim_idn // 2), random_state=0))
+            else:
+                idn_tr = idn_pool
+            cols = ["id", "label", "type", "source", "path"]
+            tr = pd.concat([tr[cols], idn_tr[cols]], ignore_index=True)
+
+            if args.heldout_idnet:
+                idn_ho = idn[idn.type.isin(args.heldout_idnet.split(","))]
+                idn_val = idn_ho.groupby("label", group_keys=False).apply(
+                    lambda g: g.sample(min(len(g), args.idn_val_n // 2), random_state=1))
+            elif args.idn_val_from_unused:
+                # every country trains; validation = images the lim_idn sample above did NOT
+                # pick (same countries, disjoint rows, zero overlap with training by construction).
+                unused = idn_pool[~idn_pool.id.isin(set(idn_tr.id))]
+                idn_val = unused.groupby("label", group_keys=False).apply(
+                    lambda g: g.sample(min(len(g), args.idn_val_n // 2), random_state=1))
+            # else: no held-out IDNet slice at all -> idn_val stays None, idl stays None;
+            # sel_map["idnet"] falls back to clean FREUID (meaningless once --full_data is
+            # set, since va is IN training) -- avoid this combination, prefer the branches above.
+    groups = parse_groups(args.aug)
+    gname, gkey = ("GEN-VAL", "genval") if args.split_dir else ("HELDOUT-IDNet", "idnet")
+    print(f"[{vname}] train={len(tr)} {tr.source.value_counts().to_dict()} "
+          f"val={len(va)}  {gname}={0 if idn_val is None else len(idn_val)}  "
+          f"res={H}x{W} aug_groups={sorted(groups)} sbi={args.sbi} attacks={args.attacks} "
+          f"select_on={args.select_on}")
+
+    wb = None
+    if args.wandb:
+        import wandb
+        wb = wandb.init(project=args.wandb_project, name=f"{args.tag}_{vname}",
+                        id=f"{args.tag}_{vname}", resume="allow",
+                        group=args.wandb_group, job_type=args.wandb_job_type,
+                        config={**vars(args), "n_train": len(tr), "n_val": len(va),
+                                "n_idnet_val": 0 if idn_val is None else len(idn_val)})
+
+    tds = TrainDS(tr.id.tolist(), tr.label.values, tr.type.tolist(), H, W, groups, args.sbi, args.attacks,
+                 sources=tr.source.tolist(), paths=tr.path.tolist())
+    vds = ValDS(va.id.tolist(), va.label.values, H, W,
+                paths=va.path.tolist() if "path" in va.columns else None)
+    tdl = DataLoader(tds, batch_size=args.bs, shuffle=True, num_workers=args.workers,
+                     pin_memory=True, drop_last=True, persistent_workers=True,
+                     worker_init_fn=_worker_init)
+    vdl = DataLoader(vds, batch_size=args.eval_bs, shuffle=False, num_workers=8, pin_memory=True)
+    hvdl = (DataLoader(HardValDS(va.id.tolist(), va.label.values, H, W),
+                       batch_size=args.eval_bs, shuffle=False, num_workers=8, pin_memory=True)
+            if args.hardval else None)
+    idl = (DataLoader(IDNetEvalDS(idn_val, H, W), batch_size=args.eval_bs, shuffle=False,
+                      num_workers=8, pin_memory=True)
+           if idn_val is not None else None)
+
+    model = FreuidModel(backbone=args.backbone, lora_r=args.lora_r, head_type=args.head_type).cuda()
+    nt = model.trainable_params()
+    print(f"trainable {nt/1e6:.2f}M  lora_modules={model.n_lora}")
+    if args.grad_ckpt:
+        model.backbone.set_grad_checkpointing(True)
+    amp_dtype = torch.bfloat16 if args.precision == "bf16" else torch.float16
+    # `model` stays the source of truth for state_dict/eval; `fwd` is what the train step calls.
+    fwd = torch.compile(model, dynamic=False) if args.compile else model
+    # Always-on cost readouts (PROFILING.md): forward FLOPs counted once on the fixed train
+    # batch shape; peak from GPU name -> MFU per epoch alongside img/s.
+    fwd_flops = count_forward_flops(model, torch.randn(args.bs, 3, H, W, device="cuda"), amp_dtype)
+    peak = gpu_peak_tflops(override=args.gpu_peak_tflops)
+    print(f"perf: gpu={torch.cuda.get_device_name()} peak={peak or 'unknown'} TFLOPS "
+          f"fwd={fwd_flops/1e9:.1f} GFLOP/batch(bs={args.bs}) precision={args.precision} "
+          f"compile={args.compile} fused_opt={args.fused_opt} grad_ckpt={args.grad_ckpt}", flush=True)
+    head_p = [p for n, p in model.named_parameters() if p.requires_grad and "head" in n]
+    lora_p = [p for n, p in model.named_parameters() if p.requires_grad and "head" not in n]
+    opt = torch.optim.AdamW([
+        {"params": head_p, "lr": args.lr_head, "weight_decay": args.wd},
+        {"params": lora_p, "lr": args.lr_lora, "weight_decay": 0.0},
+    ], fused=args.fused_opt)
+    steps = max(1, len(tdl) // args.accum) * args.epochs
+    warm = max(1, int(0.05 * steps))
+    def lr_at(s): return s / warm if s < warm else 0.5 * (1 + math.cos(math.pi * (s - warm) / max(1, steps - warm)))
+    sched = torch.optim.lr_scheduler.LambdaLR(opt, lr_at)
+    scaler = torch.amp.GradScaler("cuda", enabled=(args.precision == "fp16"))
+    last_path = os.path.join(CKPT_DIR, f"{args.tag}_{vname}_last.pt")
+    best_path = os.path.join(CKPT_DIR, f"{args.tag}_{vname}.pt")
+    best = {"freuid": 1e9}; gstep = 0; start_ep = 0; resumed = False
+
+    def save_state(ep):
+        torch.save({"model": model.state_dict(), "opt": opt.state_dict(),
+                    "sched": sched.state_dict(), "scaler": scaler.state_dict(),
+                    "ep": ep, "gstep": gstep, "best": best, "args": vars(args)}, last_path)
+
+    if args.resume and os.path.exists(last_path):
+        ck = torch.load(last_path, map_location="cuda")
+        model.load_state_dict(ck["model"]); opt.load_state_dict(ck["opt"])
+        sched.load_state_dict(ck["sched"]); scaler.load_state_dict(ck["scaler"])
+        start_ep = ck["ep"] + 1; gstep = ck["gstep"]; best = ck["best"]; resumed = True
+        print(f"resumed {last_path} -> start ep{start_ep} (best={best.get('freuid'):.4f})", flush=True)
+
+    ttdl = TimedLoader(tdl)
+    if args.lp_epochs > 0 and not resumed:
+        # Gate on "no checkpoint loaded", NOT start_ep == 0: the mid-epoch save writes ep-1, so a
+        # crash inside FT epoch 0 resumes with start_ep == 0 and would re-run LP on a head that is
+        # already LP'd and a LoRA that is already partly trained (review, 2026-09-24).
+        # LP phase: LoRA frozen at init (B=0 -> backbone output == frozen DINOv2), head-only AdamW at a
+        # constant lr_head, fresh optimizer; the main opt/sched below start untouched from the LP'd head.
+        n_frozen = set_lora_trainable(model, False)
+        lp_opt = torch.optim.AdamW(head_p, lr=args.lr_head, weight_decay=args.wd, fused=args.fused_opt)
+        print(f"LP-FT: {args.lp_epochs} head-only epoch(s), {n_frozen/1e6:.2f}M LoRA params frozen", flush=True)
+        for k in range(args.lp_epochs):
+            model.train(); t0 = time.time(); run = 0.0
+            lp_opt.zero_grad(set_to_none=True)
+            for it, (x, y) in enumerate(ttdl):
+                x = x.cuda(non_blocking=True); y = y.cuda(non_blocking=True)
+                with torch.autocast("cuda", dtype=amp_dtype):
+                    # UNCOMPILED model here: a graph traced with LoRA frozen is not re-traced after
+                    # unfreezing (2026-09-24 smoke: FT epoch ran at 0.7 GB / 72 img/s = head-only).
+                    # The compiled `fwd` is first traced at the first FT step, LoRA trainable.
+                    loss = focal_bce(model(x), y) / args.accum
+                scaler.scale(loss).backward(); run += loss.item() * args.accum
+                if (it + 1) % args.accum == 0:
+                    scaler.step(lp_opt); scaler.update(); lp_opt.zero_grad(set_to_none=True)
+            lp_t = time.time() - t0
+            f, a, apc, _ = evaluate(model, vdl, amp_dtype)
+            msg = f"== lp{k} loss={run/max(1,it+1):.4f} clean FREUID={f:.4f}(AUC={1-a:.4f}) train={lp_t:.0f}s({len(tds)/lp_t:.1f}img/s)"
+            lp_log = {"lp/clean_freuid": f, "lp/clean_audet": a, "lp/train_sec": lp_t}
+            if idl is not None:
+                idf, ida, idapc, gp = evaluate(model, idl, amp_dtype)
+                msg += f" | {gname} FREUID={idf:.4f}"
+                if gen is not None:
+                    gm = genval_metrics(gen, gp)
+                    msg += f" macro_source={gm['macro_source']:.4f}"
+                    lp_log["lp/genval_macro_source"] = gm["macro_source"]
+            print(msg, flush=True)
+            if wb is not None:
+                wb.summary.update({f"{kk}_ep{k}": v for kk, v in lp_log.items()})
+        set_lora_trainable(model, True)
+        del lp_opt; torch.cuda.empty_cache()
+    for ep in range(start_ep, args.epochs):
+        model.train(); t0 = time.time(); run = 0.0
+        torch.cuda.reset_peak_memory_stats()
+        opt.zero_grad(set_to_none=True)
+        prof = None
+        if args.profile and ep == start_ep:   # one trace per run, first trained epoch
+            pdir = os.path.join(ROOT, "profiles", args.tag)
+            prof = torch.profiler.profile(
+                activities=[torch.profiler.ProfilerActivity.CPU,
+                            torch.profiler.ProfilerActivity.CUDA],
+                schedule=torch.profiler.schedule(wait=5, warmup=2, active=5, repeat=1),
+                on_trace_ready=torch.profiler.tensorboard_trace_handler(pdir))
+            prof.start()
+            print(f"profiling: trace -> {pdir} (view: tensorboard --logdir {pdir})", flush=True)
+        for it, (x, y) in enumerate(ttdl):
+            x = x.cuda(non_blocking=True); y = y.cuda(non_blocking=True)
+            with torch.autocast("cuda", dtype=amp_dtype):
+                loss = focal_bce(fwd(x), y) / args.accum
+            scaler.scale(loss).backward(); run += loss.item() * args.accum   # .item() = per-step sync (TimedLoader relies on it)
+            if (it + 1) % args.accum == 0:
+                scaler.step(opt); scaler.update(); opt.zero_grad(set_to_none=True)
+                sched.step(); gstep += 1
+                if args.save_every and gstep % args.save_every == 0:
+                    save_state(ep - 1)  # mid-epoch crash -> resume redoes this epoch (no data skipped)
+            if prof is not None:
+                prof.step()
+            if (it + 1) % (args.accum * 25) == 0:
+                el = time.time() - t0; ips = (it + 1) * args.bs / el
+                print(f"  ep{ep} it{it+1}/{len(tdl)} loss={run/(it+1):.4f} lr={sched.get_last_lr()[0]:.2e} "
+                      f"{ips:.1f}img/s wait={ttdl.wait/el:.0%}", flush=True)
+        if prof is not None:
+            prof.stop()
+            with open(os.path.join(pdir, "key_averages.txt"), "w") as fk:   # diagnose from the log, no viewer needed
+                fk.write(prof.key_averages().table(sort_by="cuda_time_total", row_limit=40))
+        train_t = time.time() - t0; tput = len(tds) / train_t
+        wait_frac = ttdl.wait / train_t
+        peak_mem = torch.cuda.max_memory_allocated() / 2**30
+        tflops, mfu = step_metrics(fwd_flops, len(tdl), train_t, peak)
+        torch.cuda.empty_cache()
+        t_eval = time.time()
+        f, a, apc, p = evaluate(model, vdl, amp_dtype)
+        hf = ha = hap = None
+        if args.hardval:
+            hf, ha, hap, _ = evaluate(model, hvdl, amp_dtype)
+        idf = ida = idapc = None; gm = None
+        if idl is not None:
+            idf, ida, idapc, gp = evaluate(model, idl, amp_dtype)
+            if args.split_dir:                # step 2: per-source report + offline tie-rule inputs
+                gm = genval_metrics(gen, gp)
+                np.save(os.path.join(OOF_DIR, f"genvalpred_{args.tag}_{vname}_ep{ep}.npy"), gp)
+                gen[["id", "label", "type", "source"]].to_csv(
+                    os.path.join(OOF_DIR, f"genval_{args.tag}_{vname}.csv"), index=False)
+                torch.save({"model_lean": lean_state(model), "args": vars(args), "ep": ep},
+                           os.path.join(CKPT_DIR, f"{args.tag}_{vname}_ep{ep}_lean.pt"))
+        torch.cuda.empty_cache()
+        # SELECT ON HELDOUT-IDNet: the in-domain FREUID val (clean AND corrupted "hard" proxy)
+        # proved unreliable for RANKING checkpoints (2026-07-08: fold2's best-ever local score
+        # scored WORSE on the real LB than fold1's mediocre one). IDNet has zero leakage risk.
+        sel_map = {"idnet": idf, "genval": (gm["macro_source"] if gm else idf), "hard": hf, "clean": f}
+        sel = sel_map[args.select_on] if sel_map[args.select_on] is not None else f
+        eval_t = time.time() - t_eval  # val + hard + gen-val passes; ~1/4 of an epoch (PROFILING.md)
+        msg = f"== ep{ep} clean FREUID={f:.4f}(AUC={1-a:.4f},APCER@1%={apc:.4f})"
+        if args.hardval:
+            msg += f" | HARD FREUID={hf:.4f}(AUC={1-ha:.4f},APCER@1%={hap:.4f})"
+        if idl is not None:
+            msg += f" | {gname} FREUID={idf:.4f}(AUC={1-ida:.4f},APCER@1%={idapc:.4f})"
+        msg += (f" | train={train_t:.0f}s({tput:.1f}img/s) wait={wait_frac:.0%} "
+                f"peak_mem={peak_mem:.1f}GB {tflops:.1f}TFLOPS" + (f" MFU={mfu:.0%}" if mfu is not None else "")
+                + f" eval={eval_t:.0f}s")
+        print(msg, flush=True)
+        if gm is not None:
+            print("   GEN-VAL " + "  ".join(f"{k}={v:.4f}" for k, v in sorted(gm["per_source"].items()))
+                  + f"  | macro_type={gm['macro_type']:.4f}  macro_source={gm['macro_source']:.4f}"
+                  + ("  <- selection" if args.select_on == "genval" else ""), flush=True)
+        if wb is not None:
+            log = {"train/loss": run / max(1, it + 1), "train/sec": train_t, "eval/sec": eval_t,
+                   "train/img_per_s": tput, "lr": sched.get_last_lr()[0],
+                   "perf/data_wait_frac": wait_frac, "perf/peak_mem_gb": peak_mem,
+                   "perf/tflops": tflops, **({"perf/mfu": mfu} if mfu is not None else {}),
+                   "clean/freuid": f, "clean/audet": a, "clean/apcer": apc}
+            if hf is not None:
+                log.update({"hard/freuid": hf, "hard/audet": ha, "hard/apcer": hap})
+            if idf is not None:
+                log.update({f"{gkey}/freuid": idf, f"{gkey}/audet": ida, f"{gkey}/apcer": idapc})
+            if gm is not None:
+                log.update({f"genval/{k}": v for k, v in gm["per_source"].items()})
+                log.update({f"genval/type/{k}": v for k, v in gm["per_type"].items()})
+                log.update({"genval/macro_type": gm["macro_type"], "genval/macro_source": gm["macro_source"]})
+            wb.log(log, step=ep, commit=True)  # explicit step w/o commit is held until the next step (2026-09-23)
+        if sel < best["freuid"]:
+            best = {"freuid": float(sel), "clean": float(f), "hard": (float(hf) if hf is not None else None),
+                    "idnet": (float(idf) if idf is not None else None),
+                    "macro_source": (float(gm["macro_source"]) if gm else None),
+                    "macro_type": (float(gm["macro_type"]) if gm else None),
+                    "audet": float(a), "apcer": float(apc), "epoch": ep}
+            torch.save({"model": model.state_dict(), "args": vars(args), "val": best}, best_path)
+            np.save(os.path.join(OOF_DIR, f"valpred_{args.tag}_{vname}.npy"), p)
+            np.save(os.path.join(OOF_DIR, f"valid_{args.tag}_{vname}.npy"), va.id.values)
+            if wb is not None:
+                wb.summary.update({f"best/{k}": v for k, v in best.items()})
+        save_state(ep)  # after the best-update: _last.pt must carry this epoch's best (resume bug, 2026-09-21)
+    print(f"BEST {vname}: sel(FREUID)={best['freuid']:.4f} clean={best.get('clean'):.4f} "
+          f"hard={best.get('hard')} (ep{best.get('epoch')})")
+    with open(os.path.join(CKPT_DIR, f"{args.tag}_{vname}.json"), "w") as fjson:
+        json.dump(best, fjson, indent=2)
+    if wb is not None:
+        wb.alert(title=f"run finished: {args.tag}_{vname}",
+                 text=f"best sel={best['freuid']:.4f} (ep{best.get('epoch')}); "
+                      f"clean={best.get('clean')} idnet={best.get('idnet')}")
+        wb.finish()
+
+
+if __name__ == "__main__":
+    main()

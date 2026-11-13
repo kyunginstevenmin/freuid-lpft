@@ -1,0 +1,114 @@
+"""2a acceptance tests (`pytest tests/`): a YAML config must resolve to the EXACT
+same namespace as the equivalent CLI command; explicit CLI beats YAML beats defaults;
+bad configs are rejected loudly. Importing train pulls torch/cv2/timm -- runs where
+the full (CPU is fine) stack exists.
+"""
+import glob, os
+
+import pytest
+
+from train import resolve_args, validate_cfg, build_parser, LEGACY_DATA_FLAGS
+
+REPO = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
+CFG_OWN = os.path.join(REPO, "configs", "own_v2_ctrl_s42.yaml")
+CFG_OWN_LPFT = os.path.join(REPO, "configs", "own_v2_B_lpft_s42.yaml")
+CFG_OWN_L_LPFT = os.path.join(REPO, "configs", "own_v2_L_lpft_s42.yaml")
+
+# The own-run plan's step-3 control arm, as flags:
+CLI_OWN = ("--split_dir ../../id-fraud-detection/dataset_final --epochs 5 --bs 6 --accum 4 "
+           "--eval_bs 32 --res 448x728 --aug core --sbi 0.0 --backbone vit_large_patch14_reg4_dinov2 "
+           "--head_type patch --lora_r 16 --select_on genval --workers 16 --save_every 250 "
+           "--wandb --wandb_project freuid-own --wandb_group own_v2 --wandb_job_type ctrl --seed 42 --tag own_v2_ctrl_s42 "
+           "--compile --fused_opt").split()   # speed knobs adopted at 3c (2026-09-22)
+
+def ns_dict(ns):
+    # 'config' is the file pointer; wandb_group/job_type are tracking labels, not recipe --
+    # both are excluded so arm deltas are exactly the recipe difference.
+    return {k: v for k, v in vars(ns).items() if k not in ("config", "wandb_group", "wandb_job_type")}
+
+
+def test_precedence():
+    args = resolve_args(["--config", CFG_OWN, "--epochs", "1"])
+    assert args.epochs == 1          # explicit CLI beats YAML
+    assert args.bs == 6              # YAML beats default (24)
+    assert args.lr_head == 1e-3      # default survives when neither sets it
+
+
+@pytest.mark.parametrize("yaml_text", [
+    "lora_rr: 8",                    # unknown key (typo)
+    "- a\n- b",                      # top-level list
+    "epochs: five",                  # uncoercible type
+    "full_data: 1",                  # non-bool for store_true
+    "select_on: leaderboard",        # value not in choices
+    "config: other.yaml",            # config-in-config
+], ids=["typo-key", "not-a-mapping", "bad-type", "int-for-bool", "bad-choice", "nested-config"])
+def test_bad_configs_rejected(tmp_path, yaml_text):
+    p = tmp_path / "bad.yaml"
+    p.write_text(yaml_text)
+    with pytest.raises(SystemExit, match="--config"):
+        resolve_args(["--config", str(p)])
+
+
+def test_coercion_and_yaml_bools(tmp_path):
+    p = tmp_path / "ok.yaml"
+    p.write_text("epochs: '5'\nfull_data: yes\n")     # str->int coercion + yaml bool
+    args = resolve_args(["--config", str(p)])
+    assert args.epochs == 5 and args.full_data is True
+
+
+def test_empty_config_is_noop():
+    assert validate_cfg({}, build_parser()) == {}
+
+
+def test_own_ctrl_yaml_equals_cli():
+    a, b = resolve_args(CLI_OWN), resolve_args(["--config", CFG_OWN])
+    assert ns_dict(a) == ns_dict(b)
+
+
+def test_own_B_lpft_arm_delta_is_exactly_backbone_and_lp():
+    """Plan step 6: the LP-FT arm (on B for speed) differs from the control by {backbone, lp_epochs} + tag."""
+    ctrl, arm = ns_dict(resolve_args(["--config", CFG_OWN])), ns_dict(resolve_args(["--config", CFG_OWN_LPFT]))
+    assert {k for k in ctrl if ctrl[k] != arm[k]} == {"backbone", "lp_epochs", "tag"}
+    assert arm["lp_epochs"] == 1 and arm["backbone"] == "vit_base_patch14_reg4_dinov2"
+
+
+def test_own_L_lpft_arm_delta_is_exactly_lp():
+    """Program 2 step 2: the L + LP-FT arm differs from the control by {lp_epochs} + tag only --
+    the L pair then differs in nothing but LP-FT (readout is fixed per backbone, not per model)."""
+    ctrl, arm = ns_dict(resolve_args(["--config", CFG_OWN])), ns_dict(resolve_args(["--config", CFG_OWN_L_LPFT]))
+    assert {k for k in ctrl if ctrl[k] != arm[k]} == {"lp_epochs", "tag"}
+    assert arm["lp_epochs"] == 1 and arm["backbone"] == "vit_large_patch14_reg4_dinov2"
+    # and it is the B arm's flag, not a new one: same lp_epochs as own_v2_B_lpft_s42
+    assert arm["lp_epochs"] == ns_dict(resolve_args(["--config", CFG_OWN_LPFT]))["lp_epochs"]
+
+
+def test_own_ctrl_is_the_plain_recipe():
+    """Control arm = split_dir mode with no legacy data flags and no speed knobs: the
+    step-3c decision adds compile/fused_opt to the YAML explicitly, never by accident."""
+    args = resolve_args(["--config", CFG_OWN])
+    defaults = vars(build_parser().parse_args([]))
+    assert args.split_dir and args.select_on == "genval"
+    assert all(getattr(args, k) == defaults[k] for k in LEGACY_DATA_FLAGS)
+    assert (args.precision, args.grad_ckpt) == ("fp16", False)
+    if args.compile or args.fused_opt:          # allowed only once 3c has decided, on record
+        assert "3c" in open(CFG_OWN).read()
+
+
+def test_git_state_is_a_sha_and_a_flag():
+    """git_sha/git_dirty are set in main() after resolution (never from a YAML), so the
+    resolved dump, checkpoints and W&B config all carry the training commit."""
+    from train import git_state
+    sha, dirty = git_state()
+    assert sha is None or (len(sha) == 40 and int(sha, 16) >= 0)
+    assert dirty in (None, True, False)
+    with pytest.raises(SystemExit):
+        validate_cfg({"git_sha": "abc"}, build_parser())   # not a flag: a YAML may not set it
+
+
+@pytest.mark.parametrize("cfg", sorted(glob.glob(os.path.join(os.path.dirname(__file__), "..", "configs", "own_v2_*.yaml"))))
+def test_real_arm_configs_log_by_default(cfg):
+    """Every own_v2 arm logs to W&B with a group and job_type -- decided 2026-10-08 as a
+    commit-time check (not a launch-time gate: W&B is a view, the S3-synced oof/logs/ckpts
+    + results/epoch_freezes.csv are the record). Catches a copy-pasted YAML that drops the keys."""
+    args = resolve_args(["--config", cfg])
+    assert args.wandb and args.wandb_group and args.wandb_job_type, os.path.basename(cfg)

@@ -1,0 +1,17 @@
+aggregation sweep (scale 1.0), gen-val source-macro:
+w       0.00    0.25    0.50    0.75    1.00
+frac                                        
+0.02  0.0384  0.0365  0.0334  0.0327  0.0321
+0.05  0.0384  0.0374  0.0356  0.0349  0.0339
+0.10  0.0384  0.0378  0.0365  0.0359  0.0374
+0.20  0.0384  0.0380  0.0374  0.0367  0.0388
+raw point (frac 0.1, w 0.5): 0.0365; best: frac 0.02, w 1.0 -> 0.0321
+
+2x2 readout ablation (source-macro [95% CI]):
+     cell  frac   w   tta  macro_source  ci_lo  ci_hi  src/fantasyid  src/freuid  src/idnet  src/sidt
+      raw  0.10 0.5 False        0.0365 0.0245 0.0442         0.0601      0.0002     0.0858       0.0
+    sweep  0.02 1.0 False        0.0321 0.0263 0.0357         0.0320      0.0002     0.0961       0.0
+  raw_tta  0.10 0.5  True        0.0275 0.0188 0.0316         0.0381      0.0001     0.0717       0.0
+sweep_tta  0.02 1.0  True        0.0251 0.0201 0.0291         0.0229      0.0001     0.0773       0.0
+
+rows appended -> results/readout_sweep.csv, results/readout_ablation.csv; per-cell score caches in preds/

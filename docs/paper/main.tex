@@ -1,0 +1,296 @@
+% LP-FT x backbone size on FREUID 2026 -- preprint.
+% Self-contained NeurIPS-style preprint layout (no venue .sty required).
+% Source of record: ../WRITEUP-LPFT.md.
+\documentclass[10pt]{article}
+\usepackage[letterpaper,textwidth=5.5in,textheight=9in,hcentering,vmarginratio=1:1]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{newtxtext,newtxmath}
+\usepackage{microtype}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{tabularx}
+\usepackage{array}
+\newcolumntype{R}[1]{>{\raggedright\arraybackslash}p{#1}}
+\usepackage{multirow}
+\usepackage{caption}
+\usepackage{enumitem}
+\usepackage[skip=0.6\baselineskip plus 2pt, indent=0pt]{parskip}
+\usepackage[numbers,sort&compress]{natbib}
+\usepackage[hidelinks]{hyperref}
+\usepackage{url}
+\usepackage{xcolor}
+\usepackage{titlesec}
+\usepackage{authblk}
+
+\titleformat{\section}{\large\bfseries}{\thesection}{0.8em}{}
+\titleformat{\subsection}{\normalsize\bfseries}{\thesubsection}{0.8em}{}
+\titlespacing*{\section}{0pt}{2.2ex plus .5ex}{0.6ex}
+\titlespacing*{\subsection}{0pt}{1.6ex plus .4ex}{0.3ex}
+\captionsetup{font=small,labelfont=bf,skip=4pt}
+\setlist{nosep,leftmargin=*,topsep=2pt}
+\renewcommand\Affilfont{\small}
+\newcommand{\ci}[2]{{\footnotesize[#1, #2]}}
+\newcommand{\lpft}{LP-FT}
+\newcommand{\genval}{generalization validation set}
+\newcommand{\Genval}{Generalization validation set}
+
+\title{Linear probing then fine-tuning improves out-of-distribution generalization on ViT-L but not ViT-B for identity-document fraud detection}
+\author{Kyungin Min}
+\affil{\texttt{kyunginstevenmin@gmail.com}}
+\date{November 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+\noindent Linear probing followed by fine-tuning (\lpft) often leads to better out-of-distribution (OOD) generalization than fine-tuning (FT) alone. We tested both training methods on Vision Transformer (ViT) models for an identity-document fraud detection task that tests OOD generalization to unseen document types and capture methods. We find that \lpft\ does improve OOD generalization on the ViT-L model but harms OOD generalization on the ViT-B variant. On the competition's private submission set, \lpft\ took ViT-L from 0.1253 to 0.0936 and ViT-B from 0.1930 to 0.2405 (lower is better). The effect runs through the upper tail of genuine scores, which \lpft\ lowered on ViT-L and raised on ViT-B. One candidate explanation is better pretrained features on ViT-L, which a one-epoch linear probe supports.
+\end{abstract}
+
+\section{Introduction}
+Fine-tuning a pretrained backbone with a randomly initialized head is a common recipe in transfer learning. However, a randomly initialized head needs large gradient updates, and training the head distorts the backbone features because the head and backbone gradients are coupled~\citep{kumar2022finetuning}. Consequently, the backbone and head converge to weights that fit the in-distribution (ID) training data but generalize poorly out-of-distribution (OOD). This feature distortion harms OOD performance under two conditions: (1)~when the distribution shift between ID and OOD is large, and (2)~when the pretrained features are good. Training the head first by linear probing (LP) and then fine-tuning (FT) aligns the head weights to the task before fine-tuning the backbone. The backbone then receives task-aligned gradients from the start rather than the large, misaligned ones a random head produces. Empirically, \lpft\ cuts feature change by $10\times$ to $100\times$ on the benchmarks of \citet{kumar2022finetuning} and gains about 10 percentage points on average on OOD sets~\citep{kumar2022finetuning}.
+
+We tested whether the OOD generalization gains of \lpft\ translate to an identity-document fraud detection task from the FREUID Kaggle competition~\citep{freuid2026}. The competition scores generalization to document types and capture methods absent from training, the regime in which \lpft\ is expected to help.
+
+We trained ViT-L and ViT-B models with low-rank adaptation (LoRA) adapters and a classification head under the two training methods, FT and \lpft. We evaluated two backbone sizes to see how feature quality affects the OOD generalization gains of \lpft. The backbones are DINOv2 models with registers~\citep{darcet2024registers}, pretrained on the same data and distilled from the same ViT-g teacher~\citep{oquab2023dinov2}, and only differ in capacity.
+
+We evaluated the models on one ID set and two OOD sets. The ID set is a validation set we constructed from four open-source identity-document fraud detection datasets. It contains the same document types as the training set but unseen images.
+
+The two OOD sets are the \genval\ and the private submission set. The \genval\ was constructed from unseen document types from the same four sources as the training and validation sets. The private submission set is the dataset the competition used to evaluate the models and it contains document types unseen during training and different document capture methods.
+
+\paragraph{Contributions.}
+\begin{enumerate}
+  \item A $2\times2$ comparison of FT and \lpft\ on ViT-B and ViT-L, each evaluated on one in-distribution set and two out-of-distribution sets.
+  \item An observed interaction between head initialization and backbone size under distribution shift: \lpft\ improves ViT-L and worsens ViT-B on both OOD sets.
+  \item The mechanism at the operating point: \lpft\ moves the upper tail of genuine scores down on ViT-L and up on ViT-B, which one shared threshold converts into attacks caught or missed.
+  \item A feature-change measurement showing that \lpft\ moves backbone features less than FT on both backbones, consistent with feature preserving effect of \lpft.
+\end{enumerate}
+
+\section{Experimental setup}
+\subsection{The model}
+Our model architecture and training configuration are adapted from the competition's winning solution~\citep{hasan2026freuid}. We train a DINOv2~\citep{oquab2023dinov2} ViT-B/14 or ViT-L/14~\citep{dosovitskiy2021vit}, loaded through timm~\citep{wightman2019timm}, with the backbone frozen and LoRA adapters~\citep{hu2021lora} of rank 16 on every attention and MLP projection. On top sits a classification head: a two-layer scorer gives each patch token a forgery (attack) logit, and the image logit is the average of two aggregations, the mean of the top 10\,\% of patch logits and an attention-weighted mean whose weights come from a learned linear gate over the same tokens (Figures~\ref{fig:model} and~\ref{fig:head}). All models minimize focal binary cross-entropy~\citep{lin2017focal} on the image logit (attack positive, $\alpha = 0.25$, $\gamma = 2$). The $\alpha$ term weights a genuine scored as an attack three times a missed attack, a weighting toward the genuine tail that the metric's APCER@1\%BPCER term also emphasizes.
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\textwidth]{figures/model.png}
+  \caption{Model diagram, drawn for ViT-L; ViT-B has 12 blocks and width 768. ID photo is letterboxed on a black canvas, keeping the aspect ratio, then normalized. Then the image is split into a total of $32\times52 = 1{,}664$ patches of $14\times14$ pixels. Each patch is linearly projected into tokens. The patch tokens are fed into the ViT model. In the PatchHead, we take the patch embeddings from the final layers of the ViT model, compute the per-patch logit and aggregate them to get an image level logit.}
+  \label{fig:model}
+\end{figure}
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=0.55\textwidth]{figures/head.png}
+  \caption{Classification head diagram. Each patch is scored independently with an MLP to get per-patch logits. The per-patch logits are aggregated to get the image level logit, the average of the top 10\,\% mean of patch logits and the attention-weighted mean of patch logits.}
+  \label{fig:head}
+\end{figure}
+
+\subsection{Training method for FT and \lpft}
+\label{sec:training}
+For \lpft, we train only the head for one epoch and then train the head and the backbone's LoRA adapters for five epochs. During head-only training, the LoRA adapters are frozen at their initialization, where the $B$ matrix is zero, so the backbone output is exactly the frozen DINOv2 features and the head sees pretrained features. The head trains with its own AdamW optimizer at the head's fine-tuning learning rate and weight decay, held constant for the epoch. The LP epoch then ends, a fresh optimizer and schedule start, the adapters are unfrozen, and the unchanged five-epoch recipe runs from the probed head.
+
+For FT, we train the head and LoRA adapters together for five epochs.
+
+The epoch-selection metric is a two-level macro: the FREUID score per type, averaged within each source, then averaged over sources, so no source dominates by count. Its 95\,\% interval is a type-stratified bootstrap over images. The epoch kept is the earliest whose selection-metric score falls inside the best epoch's interval; every run's selected epoch was epoch 4. The selection metric is computed on the \genval.
+
+Training configuration and cost are in Appendix~\ref{app:cost}.
+
+\subsection{Metric}
+The FREUID score $= 1 - \mathrm{HM}\bigl(1-\mathrm{AuDET},\ 1-\mathrm{APCER@1\%BPCER}\bigr)$, where HM is the harmonic mean; lower is better. $\mathrm{AuDET} = 1 - \text{ROC-AUC}$ (attack positive). APCER@1\%BPCER is the attack presentation classification error rate at a 1\,\% bona fide presentation classification error rate: the fraction of attacks missed at the threshold that rejects 1\,\% of genuines. AuDET is rank-based; the APCER term lives in the tail: the ordering of the highest-scored genuines against the lowest-scored attacks is what moves it.
+
+\subsection{The data: sources and splits}
+Four public sources (FREUID~\citep{freuid2026}, FantasyID~\citep{korshunov2025fantasyid}, SIDTD~\citep{boned2024sidtd}, IDNet~v2~\citep{guan2024idnet}) were ingested to create an aggregate dataset of 48 document types. From these, 37 document types form the training and validation sets. The remaining 11 document types compose the unseen-type holdout, the \genval. The training and validation sets are drawn from the same distribution; the \genval\ and the private submission set are the two OOD sets defined in Section~1. Table~\ref{tab:data} summarizes the sources; split construction (leakage grain per source) and label balance per source are in Appendix~\ref{app:splits}.
+
+\begin{table}[t]
+  \caption{Sources, capture, and split sizes. Image counts are train / validation / generalization validation; type counts are train+validation / generalization validation.}
+  \label{tab:data}
+  \footnotesize
+  \begin{tabularx}{\textwidth}{@{}l X R{1.7cm} R{3.0cm} R{2.3cm}@{}}
+    \toprule
+    Source & What it is & Capture & Images & Types \\
+    \midrule
+    FREUID & The competition's training set: synthetic templates, digital renders; digital and physical manipulations as attacks & Digital render & 42,788 / 10,697 / 15,867 & 4 / 1 (EGYPT/DL held out) \\
+    IDNet v2 & As-shipped Zenodo release: real government templates content-erased by inpainting, synthetic faces and text; four digital manipulation families & Digital render, no capture step & 11,970 / 3,030 / 5,000 & 15 / 5 (esp, fin, rus, az, ca) \\
+    SIDTD & MIDV-2020 mock cards, forged digitally, then laser-printed, laminated and video-captured on smartphones; frames cropped to the card & Physical print and capture & 6,540 / 1,700 / 367 & 7 / 3 (esp\_id, fin\_id, rus\_internalpassport) \\
+    FantasyID & 362 synthetic cards across 13 templates, photographed on two phones and a scanner; face-swap and text-diffusion attacks & Physical print and capture & 2,084 / 534 / 666 & 11 / 2 (portugal, turkiye) \\
+    \midrule
+    \textbf{Total} & & & \textbf{63,382 / 15,961 / 21,900} & \textbf{37 / 11} \\
+    \bottomrule
+  \end{tabularx}
+\end{table}
+
+\section{Results: FT vs \lpft\ on three evaluation sets}
+\label{sec:results}
+\paragraph{Experiment protocol.}
+We evaluated the four models (ViT-L and ViT-B with FT and \lpft) on the three evaluation sets (one ID set, two OOD sets). Every set is scored the same way: the FREUID score computed once over the whole set (the pooled score). For APCER@1\%BPCER, one threshold is set by all of that set's genuines together. The intervals on the \genval\ are type-stratified bootstraps over images; the validation set and the private submission set have none. Every model is scored at its training readout, the head's inference-time aggregation settings: top-$k$ fraction 10\,\% and aggregation weight 0.5 (Section~2.1), held fixed so that only backbone and \lpft\ differ between models.
+
+\paragraph{Results.}
+The pooled score is the headline for two reasons. It is how the private set is scored: one FREUID metric over the whole submission, so one APCER threshold set by all genuines together. And it is the operating condition of a deployed detector, which sets one threshold without knowing the document type, since the types that matter are the ones it has not seen. We pre-registered the per-type macro of Section~\ref{sec:training} as the selection metric instead; it gives the opposite sign on ViT-B (Section~\ref{sec:aggregation}, Appendix~\ref{app:aggregations}), and we adopted the pooled score as the headline after the private results exposed that mismatch. On ViT-L, \lpft\ does better than FT on both OOD sets: \lpft/FT score ratio 0.67 on the \genval\ with disjoint intervals, 0.75 on the private submission set. On ViT-B, \lpft\ does worse than FT on both OOD sets: \lpft/FT score ratio 1.16 on the \genval\ with disjoint intervals, 1.25 on the private submission set (Table~\ref{tab:main}).
+
+\begin{table}[t]
+  \caption{FREUID score (lower is better) at the fixed readout. \Genval\ entries carry a 95\,\% type-stratified bootstrap interval over images; the private submission set is followed by the public split in parentheses. Bold marks the better of each pair on the OOD sets.}
+  \label{tab:main}
+  \centering
+  \small
+  \begin{tabular}{@{}llccc@{}}
+    \toprule
+    Backbone & Training & Validation set & \Genval & Private submission set (public) \\
+    \midrule
+    \multirow{2}{*}{ViT-L} & FT    & 0.0018 & 0.0399 \ci{0.0369}{0.0431} & 0.1253 (0.0562) \\
+                           & \lpft & 0.0035 & \textbf{0.0267} \ci{0.0244}{0.0294} & \textbf{0.0936} (0.0268) \\
+    \midrule
+    \multirow{2}{*}{ViT-B} & FT    & 0.0064 & \textbf{0.0745} \ci{0.0693}{0.0802} & \textbf{0.1930} (0.1344) \\
+                           & \lpft & 0.0049 & 0.0866 \ci{0.0818}{0.0932} & 0.2405 (0.1208) \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\section{Analysis}
+\subsection{\lpft's effect under shift depends on the backbone, in the direction feature quality predicts}
+\lpft\ helped ViT-L and hurt ViT-B on both OOD sets. One possible explanation is that the ViT-L pretrained features are better for the task than the ViT-B pretrained features.
+
+Under the feature-distortion account~\citep{kumar2022finetuning}, \lpft\ pays off when the pretrained features are already good for the task, because \lpft\ preserves the pretrained features (tested in Section~\ref{sec:features}): a head fitted to the pretrained features keeps the early fine-tuning gradients small and task-aligned, so the feature directions that matter out-of-distribution survive, and that is only worth something if those directions were there to begin with.
+
+We measured the quality of the pretrained features by comparing the linear-probe-only score for both models. We trained a classification head on each frozen backbone for one epoch. Then we evaluated the models on the validation and \genval. The ViT-L model outperformed the ViT-B model on both sets: 0.1438 vs 0.2441 on the \genval\ and 0.1065 vs 0.1288 on the validation set (lower is better). However, two limitations are that one epoch is not a converged probe, and both probes are an order of magnitude behind their fine-tuned models, so the task needs adaptation on either backbone.
+
+\subsection{Per-type and one-threshold scoring disagree on ViT-B}
+\label{sec:aggregation}
+The same \genval\ predictions give a different sign for \lpft\ on ViT-B depending on whether each document type gets its own threshold or all types share one. Under per-type thresholds (the two-level macro of Section~\ref{sec:training}), \lpft\ outperformed FT on ViT-B, 0.0451 \ci{0.0391}{0.0551} vs 0.1068 \ci{0.0954}{0.1158}, a gain with disjoint intervals, and left the ViT-L intervals overlapping (0.0365 \ci{0.0245}{0.0442} against 0.0284 \ci{0.0249}{0.0330}). Under one threshold (Section~\ref{sec:results}), \lpft\ performed worse than FT on ViT-B and better than FT on ViT-L.
+
+Per source, under per-type thresholds, \lpft's gain on ViT-B came from FantasyID (0.292 to 0.040), offset by a loss on IDNet (0.099 to 0.128). Under a single threshold that gain is outweighed by the cross-source threshold shift described in Section~\ref{sec:tail}.
+
+On ViT-B, \lpft\ improves separation within each type but worsens the alignment of score scales across types.
+
+\subsection{Where the effect lives: the upper tail of FREUID's genuine scores}
+\label{sec:tail}
+The metric's second term is the fraction of attacks missed at the threshold that rejects 1\,\% of genuines. FREUID's held-out type supplies 73\,\% of the \genval's genuines, so under one threshold the operating point is set largely by the upper tail of FREUID's genuine scores. We measured how FT and \lpft\ affect the upper tail of FREUID's genuine scores and consequently the pooled threshold for each model. \lpft\ moved that tail and the pooled threshold in opposite directions on the two backbones (Table~\ref{tab:tail}).
+
+\begin{table}[t]
+  \caption{Upper tail of FREUID genuine scores, the pooled 1\,\% threshold it sets, and the attacks missed at that threshold by external source, on the \genval.}
+  \label{tab:tail}
+  \centering
+  \footnotesize
+  \begin{tabular}{@{}llccc@{}}
+    \toprule
+    Backbone & Training & \shortstack{FREUID genuine\\99th percentile} & \shortstack{Pooled\\threshold} & \shortstack{Attacks missed\\IDNet / FantasyID / SIDTD} \\
+    \midrule
+    \multirow{2}{*}{ViT-L} & FT    & 0.791 & 0.779 & 23\,\% / 9\,\% / 6\,\% \\
+                           & \lpft & 0.532 & 0.619 & 18\,\% / 8\,\% / 5\,\% \\
+    \midrule
+    \multirow{2}{*}{ViT-B} & FT    & 0.752 & 0.773 & 23\,\% / 34\,\% / 6\,\% \\
+                           & \lpft & 0.908 & 0.895 & 45\,\% / 40\,\% / 18\,\% \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+On ViT-B, \lpft\ pushed the hardest FREUID genuines up toward the attack scores. The 99th percentile score of FREUID genuines increases from 0.752 to 0.908 (Table~\ref{tab:tail}). Within FREUID that costs nothing: \lpft\ raised the attack scores more than the genuine tail, so a FREUID-only threshold still falls below the attacks and the within-FREUID score improves (0.037 to 0.012). However, under one threshold, the same movement drags the operating point up for every source, and the attacks from other sources scoring between the old and new thresholds flip from caught to missed. On ViT-L, \lpft\ pushed the same tail down, the shared threshold falls, and more attacks are caught.
+
+\subsection{Does \lpft\ preserve the features?}
+\label{sec:features}
+Under the feature-distortion account of \citet{kumar2022finetuning}, a randomly initialized head distorts the features of the backbone. As a corollary, we expect that: (1)~\lpft\ moves features less than FT; (2)~under FT, ID features move more than OOD features. We tested this on our three sets.
+
+The frozen DINOv2 backbone and the fine-tuned (FT or \lpft) backbone are run on the same image, and the per-image feature change is the mean over the 1,664 patch tokens of $\lVert \mathrm{trained} - \mathrm{frozen} \rVert / \lVert \mathrm{frozen} \rVert$. The images are fixed before the run: 1,000 validation set and 1,000 \genval\ images, each stratified by document type, and 1,000 private submission set images drawn uniformly. Table~\ref{tab:features} reports the mean per-image movement with a 95\,\% bootstrap interval over the 1,000 images, one seed per model. A value of 1.0 means the average patch token moved by its own length.
+
+\begin{table}[t]
+  \caption{Relative feature change $\lVert \mathrm{trained} - \mathrm{frozen} \rVert / \lVert \mathrm{frozen} \rVert$, mean over 1,000 images per set with a 95\,\% bootstrap interval; one seed per model.}
+  \label{tab:features}
+  \centering
+  \small
+  \begin{tabular}{@{}llccc@{}}
+    \toprule
+    Backbone & Training & Validation set & \Genval & Private submission set \\
+    \midrule
+    \multirow{2}{*}{ViT-L} & FT    & 0.981 \ci{0.974}{0.989} & 0.929 \ci{0.920}{0.938} & 0.994 \ci{0.985}{1.002} \\
+                           & \lpft & 0.704 \ci{0.700}{0.708} & 0.645 \ci{0.643}{0.647} & 0.665 \ci{0.662}{0.669} \\
+    \midrule
+    \multirow{2}{*}{ViT-B} & FT    & 0.960 \ci{0.953}{0.966} & 0.847 \ci{0.844}{0.851} & 0.913 \ci{0.906}{0.919} \\
+                           & \lpft & 0.750 \ci{0.747}{0.753} & 0.700 \ci{0.699}{0.702} & 0.704 \ci{0.701}{0.708} \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+FT changes the features more than \lpft\ on both backbones on all three sets.
+
+FT changes the features more on ID than OOD for both OOD sets on ViT-B but only on one set for ViT-L.
+
+\lpft\ changes the features more on ID than OOD for both backbones and both OOD sets.
+
+\subsection{The cost question that started the program}
+Under per-type scoring, \lpft\ had put ViT-B inside ViT-L's interval at $2.9\times$ the training throughput. Under the pooled score and on the private submission set it did not: ViT-B + \lpft\ is the worst of the four models, worse than ViT-B without \lpft\ and $2.6\times$ worse than ViT-L + \lpft. The large backbone, which the question hoped to replace, is the one \lpft\ helped, and ViT-L + \lpft\ has the lowest private submission set score.
+
+\section{Limitations}
+\begin{itemize}
+  \item One seed per model; \genval\ intervals are over images, not training randomness; private submission set numbers have no interval at all.
+  \item The fixed readout costs the ViT-B models more than the ViT-L models (Appendix~\ref{app:readout}), so any comparison across backbones carries some readout in it.
+  \item The feature-change measurement (Section~\ref{sec:features}) is one seed per model on 1,000 images per set.
+  \item The \genval\ is both the epoch-selection set (Section~\ref{sec:training}) and one of the two reported OOD sets, so its scores are mildly optimistic for every model. The selection rule is the earliest epoch inside the best epoch's interval and every model's selected epoch was epoch 4, so the bias is small and the same for all four models, but it is not zero.
+  \item The \lpft\ models train for six epochs (one head-only, five full) against five for the FT models. The extra epoch is a compute confound in \lpft's favor: it makes the ViT-B result (\lpft\ worse) more credible and the ViT-L result (\lpft\ better) slightly less.
+\end{itemize}
+
+\section{Conclusion}
+\lpft\ outperformed FT for ViT-L on both out-of-distribution sets and FT outperformed \lpft\ for ViT-B on both. Whether \lpft\ helped tracked the backbone, which we take as a proxy for pretrained feature quality; the probe comparison supports this, but one seed per model leaves it a hypothesis.
+
+The result on the \genval\ depends on the aggregation. Our pre-registered selection metric, the per-type macro, was mis-specified relative to the target: it sets a threshold per document type, which a deployed detector or the competition's pooled scoring never does, and it called the ViT-B pair the wrong way. A selection metric should share the target's thresholding, not only its formula. The mechanism at the operating point is that \lpft\ moved the upper tail of FREUID genuine scores up on ViT-B and down on ViT-L, which one shared threshold converts into attacks from the three non-FREUID sources missed or caught.
+
+\bibliographystyle{unsrtnat}
+\bibliography{refs}
+
+\appendix
+\section{Training configuration and cost}
+\label{app:cost}
+Images are letterboxed to $448\times728$. Training runs five epochs at batch 6 with gradient accumulation 4, fp16, focal binary cross-entropy. The ViT-L variant has 304M backbone parameters and 6.29M adapter parameters; ViT-B has 86M and proportionally fewer. Nothing about the head, the adapters or the schedule changes between runs. The \lpft\ runs add one head-only epoch before the five. One g5.4xlarge (A10G, 24\,GB) per run.
+
+\begin{table}[h]
+  \caption{Training throughput and wall time per run.}
+  \centering
+  \small
+  \begin{tabular}{@{}lrr@{}}
+    \toprule
+    Run & Throughput (img/s) & Wall time \\
+    \midrule
+    ViT-L, FT    & 12.1 & 9\,h\,27 \\
+    ViT-L, \lpft & 12.1 & 10\,h\,37 \\
+    ViT-B, FT    & 34.9 & 3\,h\,17 \\
+    ViT-B, \lpft & $\approx$\,34.9 & 3\,h\,44 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+ViT-B trains at $2.9\times$ ViT-L's throughput; the LP epoch adds 12 to 14\,\% to wall time on either backbone. Inference at the fixed readout on the 142,818 submission images took 2,034\,s on ViT-B and 5,718\,s on ViT-L, $2.8\times$.
+
+\section{Cost of the fixed readout}
+\label{app:readout}
+The cost of the fixed readout on the \genval, relative to each model's best swept readout there: fixing the top-$k$ fraction and weight costs each model less than its own interval (ViT-L $0.0321 \to 0.0365$, ViT-B + \lpft\ $0.0419 \to 0.0451$); dropping test-time augmentation (TTA) costs ViT-L $0.0275 \to 0.0365$ with overlapping intervals but ViT-B + \lpft\ $0.0310 \to 0.0451$ with disjoint ones. The fixed readout therefore handicaps the ViT-B models more than the ViT-L models on the \genval.
+
+\section{Split construction and label balance}
+\label{app:splits}
+The leakage grain differs by source because the sources repeat documents differently. FREUID rows are independent renders and are split directly, stratified by type. IDNet v2 is split 80:20 stratified per country and manipulation folder. SIDTD frames come from video clips of a physical document, and each fake is a manipulation of a base real document, so all frames and fake variants of one base document stay on one side; the training and validation sets keep ten frames per document and the \genval\ one frame per document, so near-duplicate frames do not inflate per-document metrics. FantasyID shows the same physical card about nine times across devices and attack variants, so all variants of one card stay on one side. All splits use seed 42.
+
+Label balance is 60:40 genuine to attack in the training and validation sets and 50:50 in the \genval, but it varies by source: FantasyID is 70\,\% attack, SIDTD 14 to 18\,\% attack, IDNet and FREUID near half. FREUID is 68\,\% of all rows and 72.5\,\% of the \genval, which is why the pooled and macro numbers there (Section~\ref{sec:aggregation}) can disagree. Two external sources sit on the physical side of the capture axis and two on the digital side; the competition's private submission set is FREUID with unseen document types and print-and-capture images in an unstated proportion.
+
+\section{Five aggregations of the \genval\ predictions}
+\label{app:aggregations}
+The four models' \genval\ predictions were re-scored post hoc under five aggregations, each with the type-stratified bootstrap and with the decision tree for reading the result written before it was run. The macro was the pre-registered selection metric; the pooled score was logged for every epoch of every run from the start, but reporting it as the headline (Section~\ref{sec:results}) is a choice made after the private scores existed.
+
+\begin{table}[h]
+  \caption{Four models under five aggregations of the same \genval\ predictions. Columns: (A)~macro, per-type thresholds, mean within then across sources (Section~\ref{sec:training}); (B)~per-type thresholds, image-weighted mean; (C)~one threshold per source, mean across sources; (D)~pooled, one threshold over all 21,900 images (Section~\ref{sec:results}); (E)~pooled over the three external sources only. The last row of each block gives \lpft's direction relative to FT; $^\dagger$ marks disjoint bootstrap intervals, ``overlap'' a null.}
+  \label{tab:aggregations}
+  \centering
+  \footnotesize
+  \begin{tabular}{@{}llccccc@{}}
+    \toprule
+    Backbone & Training & (A) & (B) & (C) & (D) & (E) \\
+    \midrule
+    \multirow{3}{*}{ViT-L} & FT    & 0.0365 & 0.0216 & 0.0435 & 0.0399 & 0.0890 \\
+                           & \lpft & 0.0284 & 0.0229 & 0.0416 & \textbf{0.0267} & 0.1243 \\
+                           & \lpft\ vs FT & overlap & overlap & overlap & \textbf{better}$^\dagger$ & worse$^\dagger$ \\
+    \midrule
+    \multirow{3}{*}{ViT-B} & FT    & 0.1068 & 0.0580 & 0.1561 & \textbf{0.0745} & 0.2285 \\
+                           & \lpft & 0.0451 & 0.0391 & 0.0939 & 0.0866 & 0.2223 \\
+                           & \lpft\ vs FT & better$^\dagger$ & better$^\dagger$ & better$^\dagger$ & \textbf{worse}$^\dagger$ & overlap \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+Only the pooled aggregation orders both pairs as the private submission set did, and it does so with disjoint intervals on both. Per-type thresholding alone and source weighting alone each keep the macro's ordering, and pooling the three external sources without FREUID does not reproduce it either. The agreement comes from one threshold set across FREUID and the external sources together.
+
+\end{document}
